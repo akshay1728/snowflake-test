@@ -6,7 +6,6 @@ schemachange: # Migration settings.
   create-change-history-table: true # Create history table if permissions allow.
   autocommit: false # Transaction preference; Snowflake DDL may commit implicitly.
   dry-run: false # Workflow adds --dry-run for preview runs.
-  out-of-order: false # Enforce versioned migration order.
   query-tag: "NAS_GITHUB_CICD_UAT" # Tag deployment queries.
   log-level: "INFO" # Schemachange logging verbosity.
 snowflake: # Snowflake connection settings.

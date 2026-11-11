@@ -1,0 +1,18 @@
+# Schemachange configuration for UAT.
+config-version: 2 # Schemachange configuration format version.
+schemachange: # Migration settings.
+  root-folder: "migrations" # Only approved deployment scripts are scanned; sql_scripts/ is excluded.
+  change-history-table: "NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_UAT" # Separate migration history for UAT.
+  create-change-history-table: true # Create history table if permissions allow.
+  autocommit: false # Transaction preference; Snowflake DDL may commit implicitly.
+  dry-run: false # Workflow adds --dry-run for preview runs.
+  out-of-order: false # Enforce versioned migration order.
+  query-tag: "NAS_GITHUB_CICD_UAT" # Tag deployment queries.
+  log-level: "INFO" # Schemachange logging verbosity.
+snowflake: # Snowflake connection settings.
+  account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}" # Account from GitHub Environment variables.
+  user: "{{ env_var('SNOWFLAKE_USER') }}" # Environment deployment service user.
+  role: "FR_DEPLOYMENT_UAT" # Least-privilege deployment role.
+  warehouse: "WH_UAT_INGESTION" # Environment deployment warehouse.
+  authenticator: "snowflake_jwt" # RSA key-pair/JWT authentication.
+  private-key-file: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_FILE') }}" # Temporary key file created from the GitHub Environment secret.

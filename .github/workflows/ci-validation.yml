@@ -1,0 +1,164 @@
+# NAS Snowflake CI validation
+#
+# Pull requests:
+#   - Validate YAML syntax, required environment configurations,
+#     migration naming and unique migration version identifiers.
+#   - Confirm sql_scripts/ remains separate from the Schemachange input folder.
+#
+# After merge/push to develop or release/*:
+#   - develop: run DEV Schemachange verification and dry-run.
+#   - release/*: successful CI triggers UAT deployment, which pauses for
+#     approval through the UAT GitHub Environment.
+#
+# No SQL linting, dbt, SQL validation test suite or CyberArk integration is included.
+
+name: NAS Snowflake CI Validation
+
+on:
+  pull_request:
+    branches: [develop, main, "release/**"]
+  push:
+    branches: [develop, 'release/**']
+
+permissions:
+  contents: read
+
+jobs:
+  repository-validation:
+    name: Repository and migration validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install YAML parser
+        run: python -m pip install PyYAML==6.0.2
+
+      - name: Validate YAML, configurations and migration structure
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import yaml
+
+          # Parse repository environment configuration and workflow YAML files.
+          yaml_files = (
+              list(Path("config").glob("*.yml"))
+              + list(Path(".github/workflows").glob("*.yml"))
+          )
+          if not yaml_files:
+              raise SystemExit("No YAML configuration or workflow files found.")
+
+          for path in yaml_files:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+              print(f"Valid YAML: {path}")
+
+          # Ensure all environment configuration files are present.
+          required_configs = {
+              Path("config/dev.yml"),
+              Path("config/uat.yml"),
+              Path("config/prod.yml"),
+          }
+          missing = [str(path) for path in required_configs if not path.is_file()]
+          if missing:
+              raise SystemExit(f"Missing environment configuration(s): {missing}")
+
+          # Validate deployment migration filenames and unique version identifiers.
+          migration_files = sorted(Path("migrations").rglob("*.sql"))
+          if not migration_files:
+              raise SystemExit("No deployment SQL found under migrations/")
+
+          versions = set()
+          for path in migration_files:
+              if path.name.startswith("V"):
+                  match = re.match(r"^V([0-9]+)__[a-z0-9_]+\.sql$", path.name)
+                  if not match:
+                      raise SystemExit(f"Invalid versioned migration filename: {path}")
+                  version = match.group(1)
+                  if version in versions:
+                      raise SystemExit(f"Duplicate migration version: {version}")
+                  versions.add(version)
+              elif path.name.startswith(("R__", "A__")):
+                  if not re.match(r"^[RA]__[a-z0-9_]+\.sql$", path.name):
+                      raise SystemExit(f"Invalid repeatable/always migration filename: {path}")
+              else:
+                  raise SystemExit(
+                      f"Unsupported migration prefix in {path}; expected V, R__ or A__."
+                  )
+
+          # Count working SQL files; these are not Schemachange deployment inputs.
+          working_files = list(Path("sql_scripts").rglob("*.sql"))
+          print(f"Validated {len(migration_files)} deployment migration(s).")
+          print(f"Found {len(working_files)} working SQL script(s); sql_scripts/ is not deployed.")
+          PY
+
+  dev-schemachange-preflight:
+    name: DEV Schemachange dry-run
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: repository-validation
+    runs-on: ubuntu-latest
+    environment:
+      name: DEV
+    steps:
+      - name: Checkout merged develop commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Confirm this package version against the NAS-approved Schemachange release.
+      - name: Install Schemachange
+        run: |
+          python -m pip install --upgrade pip
+          pip install schemachange==4.1.0
+
+      - name: Write DEV private key from GitHub Environment secret
+        env:
+          # Create this as an environment-level secret in GitHub Environment DEV.
+          SNOWFLAKE_PRIVATE_KEY_P8: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_P8 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SNOWFLAKE_PRIVATE_KEY_P8:-}" ]]; then
+            echo "::error::DEV GitHub Environment secret SNOWFLAKE_PRIVATE_KEY_P8 is missing."
+            exit 1
+          fi
+          KEY_FILE="$RUNNER_TEMP/snowflake_deploy_key.p8"
+          umask 077
+          printf '%s' "$SNOWFLAKE_PRIVATE_KEY_P8" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          echo "SNOWFLAKE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
+
+      - name: Verify DEV Schemachange configuration
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+        run: |
+          schemachange verify --config-file-name config/dev.yml
+
+      - name: Preview pending DEV migrations
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+        run: |
+          schemachange deploy \
+            --config-file-name config/dev.yml \
+            --dry-run
+
+      - name: Clean up temporary private key
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${SNOWFLAKE_PRIVATE_KEY_FILE:-}" && -f "$SNOWFLAKE_PRIVATE_KEY_FILE" ]]; then
+            shred -u "$SNOWFLAKE_PRIVATE_KEY_FILE" || rm -f "$SNOWFLAKE_PRIVATE_KEY_FILE"
+          fi

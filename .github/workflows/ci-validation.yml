@@ -77,7 +77,7 @@ jobs:
           versions = set()
           for path in migration_files:
               if path.name.startswith("V"):
-                  match = re.match(r"^V([^_]+)__.+\\.sql$", path.name)
+                  match = re.match(r"^V([0-9]+)__[a-z0-9_]+\.sql$", path.name)
                   if not match:
                       raise SystemExit(f"Invalid versioned migration filename: {path}")
                   version = match.group(1)
@@ -85,7 +85,7 @@ jobs:
                       raise SystemExit(f"Duplicate migration version: {version}")
                   versions.add(version)
               elif path.name.startswith(("R__", "A__")):
-                  if not re.match(r"^[RA]__.+\\.sql$", path.name):
+                  if not re.match(r"^[RA]__[a-z0-9_]+\.sql$", path.name):
                       raise SystemExit(f"Invalid repeatable/always migration filename: {path}")
               else:
                   raise SystemExit(

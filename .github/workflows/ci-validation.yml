@@ -7,7 +7,7 @@
 #
 # After merge/push to develop or release/*:
 #   - develop: run DEV Schemachange verification and dry-run.
-#   - release/*: successful  CI triggers UAT deployment, which pauses for
+#   - release/*: successful CI triggers UAT deployment, which pauses for
 #     approval through the UAT GitHub Environment.
 #
 # No SQL linting, dbt, SQL validation test suite or CyberArk integration is included.
@@ -166,6 +166,13 @@ jobs:
           schemachange deploy \
             --config-file-name config/dev.yml \
             --dry-run
+
+      - name: Execute pending DEV migrations
+        if: success()
+        shell: bash
+        run: |
+          schemachange deploy \
+            --config-file-name config/dev.yml
 
       - name: Clean up temporary private key
         if: always()

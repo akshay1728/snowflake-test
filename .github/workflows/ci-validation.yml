@@ -7,7 +7,7 @@
 #
 # After merge/push to develop or release/*:
 #   - develop: run DEV Schemachange verification and dry-run.
-#   -release/*: successful CI triggers UAT deployment, which pauses for
+#   - release/*: successful  CI triggers UAT deployment, which pauses for
 #     approval through the UAT GitHub Environment.
 #
 # No SQL linting, dbt, SQL validation test suite or CyberArk integration is included.

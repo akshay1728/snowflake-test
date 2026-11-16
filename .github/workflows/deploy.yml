@@ -204,10 +204,24 @@ jobs:
           echo "Snowflake private key file created."
 
       - name: Verify Schemachange configuration
+        # Explicit step-level mapping ensures these values are present in the
+        # process environment read by Schemachange's env_var() configuration.
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
         run: |
           schemachange verify --config-file-name "${{ steps.config.outputs.config_file }}"
 
       - name: Preview pending migrations
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
         run: |
           schemachange deploy \
             --config-file-name "${{ steps.config.outputs.config_file }}" \
@@ -215,6 +229,12 @@ jobs:
 
       - name: Execute pending migrations
         if: github.event_name == 'push' || inputs.dry_run == false
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+          SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
         run: |
           schemachange deploy \
             --config-file-name "${{ steps.config.outputs.config_file }}"

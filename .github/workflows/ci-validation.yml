@@ -105,6 +105,13 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: DEV
+    # Expose GitHub DEV Environment variables to Schemachange env_var().
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
+      SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+      SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
     steps:
       - name: Checkout merged develop commit
         uses: actions/checkout@v4
@@ -139,17 +146,23 @@ jobs:
           chmod 600 "$KEY_FILE"
           echo "SNOWFLAKE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
 
+      - name: Validate DEV Snowflake environment variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_ROLE SNOWFLAKE_WAREHOUSE; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "::error::$variable is not configured in the GitHub DEV Environment."
+              exit 1
+            fi
+            echo "$variable is configured"
+          done
+
       - name: Verify DEV Schemachange configuration
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
         run: |
           schemachange verify --config-file-name config/dev.yml
 
       - name: Preview pending DEV migrations
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
         run: |
           schemachange deploy \
             --config-file-name config/dev.yml \

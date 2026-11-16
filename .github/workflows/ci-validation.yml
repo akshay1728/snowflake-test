@@ -111,7 +111,6 @@ jobs:
       SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
       SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
       SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
-      SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
     steps:
       - name: Checkout merged develop commit
         uses: actions/checkout@v4

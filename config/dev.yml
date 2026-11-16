@@ -8,6 +8,8 @@ schemachange: # Migration settings.
   dry-run: false # Workflow adds --dry-run for preview runs.
   query-tag: "NAS_GITHUB_CICD_DEV" # Tag deployment queries.
   log-level: "INFO" # Schemachange logging verbosity.
+  vars:
+    DB: "DEV"
 snowflake: # Snowflake connection settings.
   account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}" # Account from GitHub Environment variables.
   user: "{{ env_var('SNOWFLAKE_USER') }}" # Environment deployment service user.

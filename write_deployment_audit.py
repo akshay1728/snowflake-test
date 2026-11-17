@@ -1,88 +1,36 @@
 #!/usr/bin/env python3
-"""
-Write one GitHub Actions deployment-run audit record to Snowflake.
-
-Purpose
--------
-This script is called by the GitHub Actions workflows after a Schemachange
-deployment attempt. It collects deployment and approval metadata from GitHub,
-then writes a single audit row to:
-
-    NAS_ADMIN.SCHEMACHANGE.DEPLOYMENT_AUDIT
-
-The Schemachange CHANGE_HISTORY table remains the source of truth for
-individual migration scripts. This table provides the additional GitHub
-governance context: PR information, reviewers, environment approvals,
-commit details and workflow execution details.
-
-Required GitHub Actions environment variables
-----------------------------------------------
-GITHUB_TOKEN              Built-in GitHub Actions token. The workflow must
-                          grant contents: read, pull-requests: read and
-                          actions: read permissions.
-GITHUB_REPOSITORY         Repository in owner/repository format.
-GITHUB_RUN_ID             Unique workflow run ID.
-GITHUB_RUN_NUMBER         Human-readable workflow run number (optional).
-GITHUB_WORKFLOW           Workflow name.
-GITHUB_ACTOR              User or actor that triggered the workflow.
-GITHUB_SERVER_URL         GitHub server URL; normally https://github.com.
-
-Deployment metadata variables
------------------------------
-DEPLOY_COMMIT_SHA         Exact commit SHA being deployed.
-DEPLOY_ENVIRONMENT        DEV, UAT or PROD.
-DEPLOY_SOURCE_BRANCH      Branch from which the workflow was triggered.
-DEPLOYMENT_MODE           EXECUTE or DRY_RUN.
-DEPLOYMENT_STATUS         Workflow job status supplied by the workflow.
-
-Snowflake connection variables
-------------------------------
-SNOWFLAKE_ACCOUNT         Snowflake account identifier.
-SNOWFLAKE_USER            Environment-specific deployment service user.
-SNOWFLAKE_ROLE            Environment-specific deployment role.
-SNOWFLAKE_WAREHOUSE       Environment-specific deployment warehouse.
-SNOWFLAKE_PRIVATE_KEY_FILE
-                          Path to the temporary PKCS#8 private-key file.
-
-Security notes
---------------
-- The private key is never read into this script as a string. The Snowflake
-  connector reads it from the protected temporary file.
-- GitHub API calls use the short-lived GITHUB_TOKEN supplied by Actions.
-- SQL values are passed as connector bind parameters. Do not interpolate
-  GitHub-provided strings into the SQL statement.
-- AUDIT_TABLE is a fixed, fully qualified object name controlled by this code.
-"""
-
+"""Write deployment-level and Schemachange object-level audit records to Snowflake."""
 from __future__ import annotations
 
 import importlib.metadata
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-
-# Fixed Snowflake destination. Keep this fully qualified so the connection
-# does not depend on a session-level current database or schema.
+# Parent record stores GitHub PR/reviewer/approval/deployment metadata.
 AUDIT_TABLE = "NAS_ADMIN.SCHEMACHANGE.DEPLOYMENT_AUDIT"
-
-# GitHub REST API base URL and version header used for all metadata requests.
+# Child records store one row per deployed migration or dbt resource.
+OBJECT_AUDIT_TABLE = "NAS_ADMIN.SCHEMACHANGE.DEPLOYMENT_OBJECT_AUDIT"
 GITHUB_API = "https://api.github.com"
 GITHUB_API_VERSION = "2026-03-10"
 
+# The values below match the current environment configuration files in the
+# NAS repository. An explicit environment variable can override the mapping.
+DEFAULT_HISTORY_TABLES = {
+    "DEV": "NAS_ADMIN.SCHEMACHANGE.CHANGE_HISTORY_DEV",
+    "UAT": "NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_UAT",
+    "PROD": "NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_PROD",
+}
+
 
 def required_env(name: str) -> str:
-    """
-    Read a required environment variable and fail with a clear message if it
-    is missing or empty. This avoids attempting API or Snowflake operations
-    with incomplete connection or run metadata.
-    """
+    """Read a required environment variable and fail clearly if it is absent."""
     value = os.getenv(name, "").strip()
     if not value:
         raise RuntimeError(f"Required environment variable {name} is missing.")
@@ -90,89 +38,50 @@ def required_env(name: str) -> str:
 
 
 def github_get(path: str) -> Any:
-    """
-    Send an authenticated GET request to the GitHub REST API.
-
-    The token is provided by GitHub Actions as GITHUB_TOKEN; it is not stored
-    in the repository. HTTP and network errors are raised with the endpoint
-    path and a bounded response excerpt to help diagnose permission issues.
-    """
-    token = required_env("GITHUB_TOKEN")
-
+    """Call a GitHub REST API GET endpoint using the short-lived Actions token."""
     request = urllib.request.Request(
         f"{GITHUB_API}{path}",
         headers={
             "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {required_env('GITHUB_TOKEN')}",
             "X-GitHub-Api-Version": GITHUB_API_VERSION,
             "User-Agent": "NAS-Snowflake-Deployment-Audit",
         },
         method="GET",
     )
-
     try:
-        # A finite timeout prevents the audit step from hanging indefinitely.
         with urllib.request.urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
-
     except urllib.error.HTTPError as exc:
-        # Include the HTTP status and a short body excerpt. A 403 commonly
-        # indicates missing workflow permissions; a 404 can mean the token
-        # cannot see the requested repository resource.
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
             f"GitHub API request failed ({exc.code}) for {path}: {body[:1000]}"
         ) from exc
-
     except urllib.error.URLError as exc:
-        # Network/DNS/TLS errors are different from GitHub API permission errors.
         raise RuntimeError(f"GitHub API request failed for {path}: {exc}") from exc
 
 
 def list_pr_reviews(repository: str, pull_number: int) -> list[dict[str, Any]]:
-    """
-    Retrieve all submitted review records for one pull request.
-
-    The GitHub REST API paginates this endpoint. Fetch 100 records per request
-    and continue until a shorter page is returned so older reviews are not
-    silently omitted.
-    """
+    """Retrieve all PR review pages (up to 100 review records per page)."""
     reviews: list[dict[str, Any]] = []
     page = 1
-
     while True:
         query = urllib.parse.urlencode({"per_page": 100, "page": page})
-        batch = github_get(
-            f"/repos/{repository}/pulls/{pull_number}/reviews?{query}"
-        )
-
+        batch = github_get(f"/repos/{repository}/pulls/{pull_number}/reviews?{query}")
         if not isinstance(batch, list):
-            raise RuntimeError(
-                f"Unexpected PR reviews response for PR #{pull_number}."
-            )
-
+            raise RuntimeError(f"Unexpected PR reviews response for PR #{pull_number}.")
         reviews.extend(batch)
-
-        # A page with fewer than 100 entries is the final page.
         if len(batch) < 100:
             return reviews
-
         page += 1
 
 
 def compact_pr(pr: dict[str, Any]) -> dict[str, Any]:
-    """
-    Select the PR fields needed for the audit table.
-
-    GitHub's full PR response is large. This compact representation keeps the
-    audit-relevant identifiers and branch/merge information without storing
-    the complete API response.
-    """
+    """Keep only PR metadata needed for deployment governance and traceability."""
     user = pr.get("user") or {}
     merged_by = pr.get("merged_by") or {}
     base = pr.get("base") or {}
     head = pr.get("head") or {}
-
     return {
         "number": pr.get("number"),
         "title": pr.get("title"),
@@ -186,94 +95,157 @@ def compact_pr(pr: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_table_name(table_name: str) -> str:
+    """Allow only a three-part Snowflake identifier from trusted workflow config."""
+    candidate = table_name.upper()
+    if not re.fullmatch(r"[A-Z0-9_$]+\.[A-Z0-9_$]+\.[A-Z0-9_$]+", candidate):
+        raise ValueError(
+            "SCHEMACHANGE_CHANGE_HISTORY_TABLE must be a three-part Snowflake identifier."
+        )
+    return candidate
+
+
+def get_schemachange_history_rows(
+    cursor: Any, environment: str, started_at: str | None
+) -> list[tuple[Any, ...]]:
+    """Read history rows written by this deployment after its start marker.
+
+    The GitHub workflow writes DEPLOYMENT_STARTED_AT immediately before the
+    real Schemachange deploy command. The query also filters INSTALLED_BY to
+    CURRENT_USER(), and workflow concurrency prevents overlapping deployments
+    in the same workflow/environment. Dry-runs do not set this start marker and
+    therefore do not create child migration rows.
+    """
+    if not started_at:
+        print("No DEPLOYMENT_STARTED_AT supplied; no Schemachange object rows to capture.")
+        return []
+
+    configured_table = os.getenv("SCHEMACHANGE_CHANGE_HISTORY_TABLE", "").strip()
+    history_table = validate_table_name(
+        configured_table or DEFAULT_HISTORY_TABLES.get(environment, "")
+    )
+
+    query = f"""
+        SELECT
+            VERSION,
+            DESCRIPTION,
+            SCRIPT,
+            SCRIPT_TYPE,
+            CHECKSUM,
+            EXECUTION_TIME,
+            STATUS,
+            INSTALLED_BY,
+            INSTALLED_ON
+        FROM {history_table}
+        WHERE INSTALLED_ON >= TO_TIMESTAMP_TZ(%s)
+          AND INSTALLED_BY = CURRENT_USER()
+        ORDER BY INSTALLED_ON, VERSION
+    """
+    cursor.execute(query, (started_at,))
+    rows = cursor.fetchall()
+    print(f"Found {len(rows)} Schemachange history row(s) in {history_table} for this run.")
+    return rows
+
+
+def insert_schemachange_object_rows(
+    cursor: Any,
+    deployment_id: str,
+    environment: str,
+    history_rows: list[tuple[Any, ...]],
+) -> int:
+    """Insert one child audit row for each Schemachange history entry."""
+    if not history_rows:
+        return 0
+
+    sql = f"""
+        INSERT INTO {OBJECT_AUDIT_TABLE}
+        (
+            DEPLOYMENT_ID, ENVIRONMENT, DEPLOYMENT_TOOL, OBJECT_TYPE,
+            OBJECT_NAME, OBJECT_PATH, OBJECT_UNIQUE_ID, DATABASE_NAME,
+            SCHEMA_NAME, RELATION_NAME, MATERIALIZATION, VERSION,
+            SCRIPT_TYPE, CHECKSUM, STATUS, EXECUTION_TIME, ERROR_MESSAGE,
+            EXECUTED_BY, EXECUTED_AT, DBT_INVOCATION_ID, DBT_VERSION,
+            ADAPTER_RESPONSE
+        )
+        VALUES (
+            %s, %s, 'SCHEMACHANGE', 'MIGRATION', %s, %s, NULL, NULL,
+            NULL, NULL, NULL, %s, %s, %s, %s, %s, NULL, %s, %s,
+            NULL, NULL, NULL
+        )
+    """
+
+    params = []
+    for row in history_rows:
+        version, _description, script, script_type, checksum, execution_time, status, installed_by, installed_on = row
+        # SCRIPT is retained as both the displayed object name and its best
+        # available path; Schemachange's history table may store only the file name.
+        params.append(
+            (
+                deployment_id,
+                environment,
+                script,
+                script,
+                version,
+                script_type,
+                checksum,
+                status,
+                execution_time,
+                installed_by,
+                installed_on,
+            )
+        )
+
+    cursor.executemany(sql, params)
+    return len(params)
+
+
 def main() -> None:
-    """Collect GitHub metadata and insert one deployment audit row in Snowflake."""
-    # Import inside main so syntax checks can run without the Snowflake package
-    # being installed locally. The package is installed in the GitHub runner.
+    """Collect GitHub details and write parent plus migration child audit rows."""
     import snowflake.connector
 
-    # ---------------------------------------------------------------------
-    # 1. Read the workflow run and target-environment metadata.
-    # ---------------------------------------------------------------------
     repository = required_env("GITHUB_REPOSITORY")
     run_id = required_env("GITHUB_RUN_ID")
     commit_sha = required_env("DEPLOY_COMMIT_SHA")
+    deployment_id = required_env("DEPLOYMENT_ID")
     environment = required_env("DEPLOY_ENVIRONMENT").upper()
-
     source_branch = os.getenv("DEPLOY_SOURCE_BRANCH", "")
     mode = os.getenv("DEPLOYMENT_MODE", "EXECUTE").upper()
     status = os.getenv("DEPLOYMENT_STATUS", "UNKNOWN").upper()
-
-    # When a dry-run completes successfully, record the business status as
-    # DRY_RUN rather than implying that SQL migrations were executed.
+    started_at = os.getenv("DEPLOYMENT_STARTED_AT", "").strip() or None
     if mode == "DRY_RUN" and status == "SUCCESS":
         status = "DRY_RUN"
 
-    # ---------------------------------------------------------------------
-    # 2. Find pull requests associated with the exact commit being deployed.
-    # ---------------------------------------------------------------------
-    # The commit-to-PR endpoint can return more than one PR (for example,
-    # when a commit is associated with a branch PR and a later promotion PR).
-    # Preserve all returned PRs in PR_METADATA for traceability.
+    # Find all PRs GitHub associates with the exact deployed commit.
     encoded_sha = urllib.parse.quote(commit_sha, safe="")
-    associated_prs = github_get(
-        f"/repos/{repository}/commits/{encoded_sha}/pulls"
-    )
-
+    associated_prs = github_get(f"/repos/{repository}/commits/{encoded_sha}/pulls")
     if not isinstance(associated_prs, list):
-        raise RuntimeError(
-            "Unexpected response from the commit-to-PR GitHub API."
-        )
+        raise RuntimeError("Unexpected response from the commit-to-PR GitHub API.")
 
-    # Select a primary PR for the scalar PR_NUMBER/PR_TITLE/PR_URL columns.
-    # First prefer an exact merge-commit SHA match. If GitHub does not return
-    # that match (which can happen with squash/rebase or branch promotion),
-    # fall back to the most recently merged associated PR. All PRs remain in
-    # the PR_METADATA VARIANT column, so the fallback does not discard them.
+    # Choose a primary PR for scalar columns while preserving all PRs as JSON.
     primary_pr = next(
         (pr for pr in associated_prs if pr.get("merge_commit_sha") == commit_sha),
         None,
     )
-
     if primary_pr is None and associated_prs:
         primary_pr = sorted(
-            associated_prs,
-            key=lambda item: item.get("merged_at") or "",
-            reverse=True,
+            associated_prs, key=lambda item: item.get("merged_at") or "", reverse=True
         )[0]
 
-    # ---------------------------------------------------------------------
-    # 3. Retrieve PR review history and identify each reviewer's latest state.
-    # ---------------------------------------------------------------------
+    # Use each reviewer's latest review state so an old APPROVED review is not
+    # counted if the same reviewer later submitted REQUEST_CHANGES.
     approved_reviews: list[dict[str, Any]] = []
-
     for pr in associated_prs:
         number = pr.get("number")
         if not number:
             continue
-
-        # A reviewer can submit multiple reviews on the same PR. Only use
-        # their latest submitted review state; otherwise an old APPROVED
-        # review could be incorrectly counted after a later REQUEST_CHANGES.
         latest_by_reviewer: dict[str, dict[str, Any]] = {}
-
         for review in list_pr_reviews(repository, int(number)):
-            reviewer = review.get("user") or {}
-            login = reviewer.get("login")
-
+            login = (review.get("user") or {}).get("login")
             if not login:
                 continue
-
             prior = latest_by_reviewer.get(login)
-
-            if (
-                prior is None
-                or (review.get("submitted_at") or "")
-                >= (prior.get("submitted_at") or "")
-            ):
+            if prior is None or (review.get("submitted_at") or "") >= (prior.get("submitted_at") or ""):
                 latest_by_reviewer[login] = review
-
-        # Keep only reviewers whose latest review state is APPROVED.
         for login, review in latest_by_reviewer.items():
             if str(review.get("state", "")).upper() == "APPROVED":
                 approved_reviews.append(
@@ -287,40 +259,17 @@ def main() -> None:
                     }
                 )
 
-    # ---------------------------------------------------------------------
-    # 4. Retrieve GitHub Environment protection-rule approval information.
-    # ---------------------------------------------------------------------
-    # This is separate from PR code reviews. Environment approvals are the
-    # required reviewer decisions configured under GitHub Settings ->
-    # Environments (for example, UAT and PROD deployment approvals).
-    #
-    # The API response includes approval state, reviewer, comment and
-    # environment where available. It does not provide the exact time the
-    # reviewer clicked Approve, so APPROVALS_RETRIEVED_AT below is explicitly
-    # the time this script retrieved the approval history.
-    approvals = github_get(
-        f"/repos/{repository}/actions/runs/{run_id}/approvals"
-    )
-
+    # Environment protection approvals are distinct from PR code reviews.
+    # GitHub's workflow-run approvals endpoint returns reviewer/state/comment;
+    # it does not supply the exact timestamp of the reviewer's click.
+    approvals = github_get(f"/repos/{repository}/actions/runs/{run_id}/approvals")
     if not isinstance(approvals, list):
-        raise RuntimeError(
-            "Unexpected response from the workflow-run approvals API."
-        )
-
+        raise RuntimeError("Unexpected response from the workflow-run approvals API.")
     approval_retrieved_at = datetime.now(timezone.utc).isoformat()
 
-    # Create readable comma-separated reviewer summaries as well as retaining
-    # the full structured approval/review details in VARIANT columns.
     pr_approved_by = ", ".join(
-        sorted(
-            {
-                item["reviewer"]
-                for item in approved_reviews
-                if item.get("reviewer")
-            }
-        )
+        sorted({item["reviewer"] for item in approved_reviews if item.get("reviewer")})
     )
-
     environment_approved_by = ", ".join(
         sorted(
             {
@@ -331,7 +280,6 @@ def main() -> None:
             }
         )
     )
-
     environment_approval_comments = "\n".join(
         item.get("comment", "").strip()
         for item in approvals
@@ -339,33 +287,20 @@ def main() -> None:
         and item.get("comment", "").strip()
     )
 
-    # Convert GitHub API objects into JSON strings for insertion into Snowflake
-    # VARIANT columns using PARSE_JSON() in the INSERT...SELECT statement.
     pr_metadata = [compact_pr(pr) for pr in associated_prs]
     primary = compact_pr(primary_pr) if primary_pr else {}
-
-    # ---------------------------------------------------------------------
-    # 5. Prepare workflow run details and the installed Schemachange version.
-    # ---------------------------------------------------------------------
     run_number = os.getenv("GITHUB_RUN_NUMBER")
-
     run_url = (
         f"{os.getenv('GITHUB_SERVER_URL', 'https://github.com')}/"
         f"{repository}/actions/runs/{run_id}"
     )
-
     try:
         schemachange_version = importlib.metadata.version("schemachange")
     except importlib.metadata.PackageNotFoundError:
-        # This may be None if the script is run outside the deployment runner.
         schemachange_version = None
 
-    # ---------------------------------------------------------------------
-    # 6. Connect to Snowflake using the same environment-specific key-pair
-    #    credentials used by the Schemachange deployment.
-    # ---------------------------------------------------------------------
-    # The role must have USAGE on NAS_ADMIN database/schema and INSERT on
-    # NAS_ADMIN.SCHEMACHANGE.DEPLOYMENT_AUDIT.
+    # Reuse the same deployment ID generated by the workflow. Future dbt steps
+    # in this same deployment run can use this ID to add dbt object rows later.
     connection = snowflake.connector.connect(
         account=required_env("SNOWFLAKE_ACCOUNT"),
         user=required_env("SNOWFLAKE_USER"),
@@ -373,25 +308,10 @@ def main() -> None:
         warehouse=required_env("SNOWFLAKE_WAREHOUSE"),
         authenticator="SNOWFLAKE_JWT",
         private_key_file=required_env("SNOWFLAKE_PRIVATE_KEY_FILE"),
-        session_parameters={
-            "QUERY_TAG": f"NAS_DEPLOYMENT_AUDIT|{environment}|{run_id}"
-        },
+        session_parameters={"QUERY_TAG": f"NAS_DEPLOYMENT_AUDIT|{environment}|{run_id}"},
     )
 
-    # Each workflow run receives a unique identifier. This makes it possible
-    # to distinguish retries and multiple deployment attempts for one commit.
-    deployment_id = str(uuid.uuid4())
-
-    # ---------------------------------------------------------------------
-    # 7. Insert one deployment audit record.
-    # ---------------------------------------------------------------------
-    # Use INSERT...SELECT instead of INSERT...VALUES. Snowflake does not accept
-    # PARSE_JSON() expressions in the VALUES form used in the earlier version.
-    # SELECT permits conversion of JSON strings into VARIANT values.
-    #
-    # All dynamic values remain connector bind parameters (%s). Only the
-    # fixed, code-controlled table name is interpolated into the SQL text.
-    sql = f"""
+    sql_parent = f"""
         INSERT INTO {AUDIT_TABLE}
         (
             DEPLOYMENT_ID, ENVIRONMENT, GITHUB_REPOSITORY, GITHUB_WORKFLOW,
@@ -408,10 +328,7 @@ def main() -> None:
             PARSE_JSON(%s), TO_TIMESTAMP_TZ(%s), %s, %s, %s, %s
     """
 
-    # The order of this tuple must match the placeholder order in the SQL.
-    # The three JSON strings map to PR_METADATA, PR_APPROVED_REVIEWS and
-    # ENVIRONMENT_APPROVALS respectively.
-    params = (
+    params_parent = (
         deployment_id,
         environment,
         repository,
@@ -441,24 +358,29 @@ def main() -> None:
     )
 
     try:
-        # Execute the parameterised insert and commit the audit row.
         with connection.cursor() as cursor:
-            cursor.execute(sql, params)
-
+            # Read the environment's Schemachange history rows created after
+            # this run's start marker, then write parent and child rows together.
+            history_rows = get_schemachange_history_rows(cursor, environment, started_at)
+            cursor.execute(sql_parent, params_parent)
+            migration_count = insert_schemachange_object_rows(
+                cursor, deployment_id, environment, history_rows
+            )
         connection.commit()
-
+    except Exception:
+        # Do not leave an incomplete parent record if child-detail insertion fails.
+        connection.rollback()
+        raise
     finally:
-        # Always close the Snowflake connection, including on SQL errors.
         connection.close()
 
-    # Print a concise, non-sensitive summary for the GitHub Actions log.
     print(
         "Deployment audit recorded: "
-        f"deployment_id={deployment_id}, environment={environment}, "
-        f"status={status}, run_id={run_id}, "
-        f"associated_prs={len(associated_prs)}, "
+        f"deployment_id={deployment_id}, environment={environment}, status={status}, "
+        f"run_id={run_id}, associated_prs={len(associated_prs)}, "
         f"approved_pr_reviews={len(approved_reviews)}, "
-        f"environment_approval_records={len(approvals)}"
+        f"environment_approval_records={len(approvals)}, "
+        f"schemachange_migration_rows={migration_count}"
     )
 
 
@@ -466,11 +388,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        # GitHub Actions recognises ::error:: and highlights the message in logs.
-        # Re-raise the exception so the audit step fails visibly; do not silently
-        # report success if the Snowflake audit insert did not complete.
-        print(
-            f"::error::Unable to write Snowflake deployment audit: {exc}",
-            file=sys.stderr,
-        )
+        # Fail the Actions step visibly rather than silently losing the audit.
+        print(f"::error::Unable to write Snowflake deployment audit: {exc}", file=sys.stderr)
         raise

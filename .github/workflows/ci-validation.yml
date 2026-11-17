@@ -1,16 +1,31 @@
+
 # NAS Snowflake CI validation
 #
 # develop: validate, verify, dry-run and deploy to DEV.
 # release/*: repository validation runs here; deploy.yml handles UAT.
-# One DEPLOYMENT_ID groups the parent deployment audit and all object rows.
+# hotfix/*: repository validation runs here; deploy.yml handles direct PROD.
+# main: repository validation runs here; deploy.yml handles PROD promotion.
 
 name: NAS Snowflake CI Validation
 
 on:
   pull_request:
-    branches: [develop, main, "release/**"]
+    branches:
+      - develop
+      - main
+      - 'release/**'
+      - 'Release/**'
+      - 'hotfix/**'
+      - 'Hotfix/**'
+
   push:
-    branches: [develop, 'release/**']
+    branches:
+      - develop
+      - main
+      - 'release/**'
+      - 'Release/**'
+      - 'hotfix/**'
+      - 'Hotfix/**'
 
 permissions:
   contents: read
@@ -23,9 +38,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
   repository-validation:
     name: Repository and migration validation
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -50,8 +67,12 @@ jobs:
               list(Path("config").glob("*.yml"))
               + list(Path(".github/workflows").glob("*.yml"))
           )
+
           if not yaml_files:
-              raise SystemExit("No YAML configuration or workflow files found.")
+              raise SystemExit(
+                  "No YAML configuration or workflow files found."
+              )
+
           for path in yaml_files:
               yaml.safe_load(path.read_text(encoding="utf-8"))
               print(f"Valid YAML: {path}")
@@ -61,34 +82,72 @@ jobs:
               Path("config/uat.yml"),
               Path("config/prod.yml"),
           }
-          missing = [str(path) for path in required_configs if not path.is_file()]
+
+          missing = [
+              str(path)
+              for path in required_configs
+              if not path.is_file()
+          ]
+
           if missing:
-              raise SystemExit(f"Missing environment configuration(s): {missing}")
+              raise SystemExit(
+                  f"Missing environment configuration(s): {missing}"
+              )
 
           migration_files = sorted(Path("migrations").rglob("*.sql"))
+
           if not migration_files:
-              raise SystemExit("No deployment SQL found under migrations/")
+              raise SystemExit(
+                  "No deployment SQL found under migrations/"
+              )
+
           versions = set()
+
           for path in migration_files:
               if path.name.startswith("V"):
-                  match = re.match(r"^V([0-9]+)__[a-z0-9_]+\.sql$", path.name)
+                  match = re.match(
+                      r"^V([0-9]+)__[a-z0-9_]+\.sql$",
+                      path.name
+                  )
+
                   if not match:
-                      raise SystemExit(f"Invalid versioned migration filename: {path}")
+                      raise SystemExit(
+                          f"Invalid versioned migration filename: {path}"
+                      )
+
                   version = match.group(1)
+
                   if version in versions:
-                      raise SystemExit(f"Duplicate migration version: {version}")
+                      raise SystemExit(
+                          f"Duplicate migration version: {version}"
+                      )
+
                   versions.add(version)
+
               elif path.name.startswith(("R__", "A__")):
-                  if not re.match(r"^[RA]__[a-z0-9_]+\.sql$", path.name):
-                      raise SystemExit(f"Invalid repeatable/always migration filename: {path}")
+                  if not re.match(
+                      r"^[RA]__[a-z0-9_]+\.sql$",
+                      path.name
+                  ):
+                      raise SystemExit(
+                          f"Invalid repeatable/always migration filename: {path}"
+                      )
+
               else:
                   raise SystemExit(
-                      f"Unsupported migration prefix in {path}; expected V, R__ or A__."
+                      f"Unsupported migration prefix in {path}; "
+                      "expected V, R__ or A__."
                   )
 
           working_files = list(Path("sql_scripts").rglob("*.sql"))
-          print(f"Validated {len(migration_files)} deployment migration(s).")
-          print(f"Found {len(working_files)} working/admin SQL script(s); sql_scripts/ is not deployed.")
+
+          print(
+              f"Validated {len(migration_files)} deployment migration(s)."
+          )
+          print(
+              f"Found {len(working_files)} working/admin SQL script(s); "
+              "sql_scripts/ is not deployed."
+          )
           PY
 
   dev-schemachange-preflight:
@@ -96,8 +155,10 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     needs: repository-validation
     runs-on: ubuntu-latest
+
     environment:
       name: DEV
+
     env:
       SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
@@ -127,14 +188,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ -z "${SNOWFLAKE_PRIVATE_KEY_P8:-}" ]]; then
             echo "::error::DEV GitHub Environment secret SNOWFLAKE_PRIVATE_KEY_P8 is missing."
             exit 1
           fi
+
           KEY_FILE="$RUNNER_TEMP/snowflake_deploy_key.p8"
+
           umask 077
           printf '%s' "$SNOWFLAKE_PRIVATE_KEY_P8" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
+
           echo "SNOWFLAKE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
           echo "key_file_ready=true" >> "$GITHUB_OUTPUT"
 
@@ -149,16 +214,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for variable in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_ROLE SNOWFLAKE_WAREHOUSE; do
+
+          for variable in \
+            SNOWFLAKE_ACCOUNT \
+            SNOWFLAKE_USER \
+            SNOWFLAKE_ROLE \
+            SNOWFLAKE_WAREHOUSE
+          do
             if [[ -z "${!variable:-}" ]]; then
               echo "::error::$variable is not configured in the GitHub DEV Environment."
               exit 1
             fi
+
             echo "$variable is configured"
           done
 
       - name: Verify DEV Schemachange configuration
-        run: schemachange verify --config-file-name config/dev.yml
+        run: |
+          schemachange verify \
+            --config-file-name config/dev.yml
 
       - name: Preview pending DEV migrations
         run: |
@@ -166,8 +240,6 @@ jobs:
             --config-file-name config/dev.yml \
             --dry-run
 
-      # Record the UTC lower bound immediately before executing migrations.
-      # The audit collector uses this to identify history rows created by this run.
       - name: Mark DEV migration execution start
         if: success()
         shell: bash
@@ -177,7 +249,9 @@ jobs:
       - name: Execute pending DEV migrations
         id: execute-dev-migrations
         if: success()
-        run: schemachange deploy --config-file-name config/dev.yml
+        run: |
+          schemachange deploy \
+            --config-file-name config/dev.yml
 
       - name: Record DEV deployment and migration audit in Snowflake
         if: always() && steps.write-dev-key.outputs.key_file_ready == 'true'

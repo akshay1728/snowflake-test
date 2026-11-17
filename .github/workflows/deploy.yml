@@ -1,46 +1,44 @@
+
 # NAS Snowflake deployment workflow
 #
 # Automatic promotion:
-#   - release/* -> UAT deployment (GitHub Environment approval).
-# Production promotion:
-#   - Manually run this workflow from a release branch and provide
-#     the exact commit SHA that passed UAT. PROD Environment approval is required.
+#   - release/* and Release/* -> UAT
+#   - main -> PROD after a release PR is merged and its exact source commit
+#             has a successful UAT deployment.
+#   - hotfix/* and Hotfix/* -> direct PROD deployment.
 #
-# DEV is deployed by ci-validation.yml. This workflow deliberately does not
-# deploy develop, preventing duplicate DEV deployment runs.
+# UAT and PROD use GitHub Environments. Configure required reviewers
+# in GitHub Settings -> Environments.
+#
+# DEV is deployed by ci-validation.yml.
 
 name: NAS Snowflake Schemachange Deployment
 
 on:
   push:
-    branches: ['release/**']
-  workflow_dispatch:
-    inputs:
-      release_commit:
-        description: Exact commit SHA successfully deployed to UAT
-        required: true
-        type: string
-      dry_run:
-        description: Preview pending migrations without executing them
-        required: true
-        type: boolean
-        default: false
+    branches:
+      - main
+      - 'release/**'
+      - 'Release/**'
+      - 'hotfix/**'
+      - 'Hotfix/**'
 
 permissions:
   contents: read
   pull-requests: read
   actions: read
 
-# Serialise UAT/PROD runs so a history-table time window cannot overlap another
-# deployment run from this workflow.
+# Serialize deployments so concurrent runs do not overlap.
 concurrency:
   group: nas-snowflake-release-deployment
   cancel-in-progress: false
 
 jobs:
+
   repository-validation:
     name: Validate deployment commit
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout deployment commit
         uses: actions/checkout@v4
@@ -63,77 +61,222 @@ jobs:
           import re
           import yaml
 
-          files = (list(Path("config").glob("*.yml")) + list(Path(".github/workflows").glob("*.yml")))
+          files = (
+              list(Path("config").glob("*.yml"))
+              + list(Path(".github/workflows").glob("*.yml"))
+          )
+
           if not files:
               raise SystemExit("No YAML files found")
+
           for path in files:
               yaml.safe_load(path.read_text(encoding="utf-8"))
               print(f"Valid YAML: {path}")
 
-          required = [Path("config/dev.yml"), Path("config/uat.yml"), Path("config/prod.yml")]
+          required = [
+              Path("config/dev.yml"),
+              Path("config/uat.yml"),
+              Path("config/prod.yml"),
+          ]
+
           missing = [str(p) for p in required if not p.is_file()]
           if missing:
               raise SystemExit(f"Missing config files: {missing}")
 
           migrations = sorted(Path("migrations").rglob("*.sql"))
+
           if not migrations:
-              raise SystemExit("No deployment SQL found under migrations/")
+              raise SystemExit(
+                  "No deployment SQL found under migrations/"
+              )
+
           versions = set()
+
           for path in migrations:
               if path.name.startswith("V"):
-                  match = re.match(r"^V([^_]+)__.+\.sql$", path.name)
+                  match = re.match(
+                      r"^V([^_]+)__.+\.sql$",
+                      path.name
+                  )
+
                   if not match:
-                      raise SystemExit(f"Invalid versioned migration: {path}")
+                      raise SystemExit(
+                          f"Invalid versioned migration: {path}"
+                      )
+
                   if match.group(1) in versions:
-                      raise SystemExit(f"Duplicate migration version: {match.group(1)}")
+                      raise SystemExit(
+                          f"Duplicate migration version: {match.group(1)}"
+                      )
+
                   versions.add(match.group(1))
+
               elif not re.match(r"^[RA]__.+\.sql$", path.name):
-                  raise SystemExit(f"Invalid migration filename: {path}")
+                  raise SystemExit(
+                      f"Invalid migration filename: {path}"
+                  )
+
           print(f"Validated {len(migrations)} migration(s)")
           PY
 
   resolve-target:
     name: Resolve deployment target and commit
     needs: repository-validation
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+
     outputs:
       target_environment: ${{ steps.resolve.outputs.target_environment }}
       deploy_sha: ${{ steps.resolve.outputs.deploy_sha }}
+      uat_run_id: ${{ steps.resolve.outputs.uat_run_id }}
+      promotion_source_branch: ${{ steps.resolve.outputs.promotion_source_branch }}
+      validated_source_sha: ${{ steps.resolve.outputs.validated_source_sha }}
+
     steps:
-      - name: Resolve target
+      - name: Resolve target and validate production promotion
         id: resolve
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
           SOURCE_BRANCH: ${{ github.ref_name }}
-          INPUT_RELEASE_COMMIT: ${{ inputs.release_commit }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            TARGET_ENV="PROD"
-            DEPLOY_SHA="$INPUT_RELEASE_COMMIT"
-          else
-            case "$SOURCE_BRANCH" in
-              release/*) TARGET_ENV="UAT" ;;
-              *) echo "::error::Unsupported source branch: $SOURCE_BRANCH"; exit 1 ;;
-            esac
-            DEPLOY_SHA="$GITHUB_SHA"
-          fi
+
+          TARGET_ENV=""
+          DEPLOY_SHA="$GITHUB_SHA"
+          UAT_RUN_ID=""
+          PROMOTION_SOURCE_BRANCH=""
+          VALIDATED_SOURCE_SHA=""
+
+          case "$SOURCE_BRANCH" in
+
+            release/*|Release/*)
+              TARGET_ENV="UAT"
+              ;;
+
+            hotfix/*|Hotfix/*)
+              TARGET_ENV="PROD"
+              ;;
+
+            main)
+              TARGET_ENV="PROD"
+
+              echo "Validating the PR merged into main..."
+
+              # Find the PR associated with this exact main commit.
+              PR_JSON="$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"
+              )"
+
+              PR_INFO="$(jq -c \
+                --arg merge_sha "$GITHUB_SHA" \
+                '[.[] |
+                  select(
+                    .base.ref == "main"
+                    and .merge_commit_sha == $merge_sha
+                    and .merged_at != null
+                  )
+                ] | first // empty' <<< "$PR_JSON")"
+
+              if [[ -z "$PR_INFO" ]]; then
+                echo "::error::No merged PR into main was found for this commit."
+                echo "::error::Direct pushes to main are not permitted by this workflow."
+                exit 1
+              fi
+
+              PROMOTION_SOURCE_BRANCH="$(jq -r '.head.ref' <<< "$PR_INFO")"
+              VALIDATED_SOURCE_SHA="$(jq -r '.head.sha' <<< "$PR_INFO")"
+
+              echo "PR source branch: $PROMOTION_SOURCE_BRANCH"
+              echo "PR source commit: $VALIDATED_SOURCE_SHA"
+
+              # A normal release must have passed UAT.
+              # A hotfix must already have completed its direct PROD deployment.
+              case "$PROMOTION_SOURCE_BRANCH" in
+
+                release/*|Release/*)
+                  REQUIRED_DEPLOYMENT_ENV="UAT"
+                  ;;
+
+                hotfix/*|Hotfix/*)
+                  REQUIRED_DEPLOYMENT_ENV="PROD"
+                  ;;
+
+                *)
+                  echo "::error::PR into main must originate from a release or hotfix branch."
+                  exit 1
+                  ;;
+
+              esac
+
+              echo "Checking successful ${REQUIRED_DEPLOYMENT_ENV} deployment..."
+
+              # Find a successful deployment workflow run for the exact
+              # source branch and commit associated with the merged PR.
+              RUNS_JSON="$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/deploy.yml/runs?head_sha=${VALIDATED_SOURCE_SHA}&per_page=100"
+              )"
+
+              UAT_RUN_ID="$(jq -r \
+                --arg branch "$PROMOTION_SOURCE_BRANCH" \
+                --arg sha "$VALIDATED_SOURCE_SHA" \
+                --arg required_event_env "$REQUIRED_DEPLOYMENT_ENV" \
+                '
+                (.workflow_runs // [])
+                | map(
+                    select(
+                      .head_sha == $sha
+                      and .head_branch == $branch
+                      and .event == "push"
+                      and .status == "completed"
+                      and .conclusion == "success"
+                    )
+                  )
+                | sort_by(.created_at)
+                | if length > 0 then .[-1].id else empty end
+                ' <<< "$RUNS_JSON")"
+
+              if [[ -z "$UAT_RUN_ID" ]]; then
+                echo "::error::No successful ${REQUIRED_DEPLOYMENT_ENV} deployment was found for the PR source commit."
+                echo "::error::Production promotion is blocked."
+                exit 1
+              fi
+
+              echo "Validated deployment run ID: $UAT_RUN_ID"
+              ;;
+
+            *)
+              echo "::error::Unsupported source branch: $SOURCE_BRANCH"
+              exit 1
+              ;;
+
+          esac
 
           if [[ ! "$DEPLOY_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::A full 40-character commit SHA is required."
             exit 1
           fi
+
           echo "target_environment=$TARGET_ENV" >> "$GITHUB_OUTPUT"
           echo "deploy_sha=$DEPLOY_SHA" >> "$GITHUB_OUTPUT"
+          echo "uat_run_id=$UAT_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "promotion_source_branch=$PROMOTION_SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "validated_source_sha=$VALIDATED_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Deployment target: $TARGET_ENV"
+          echo "Deployment commit: $DEPLOY_SHA"
 
   deploy:
     name: Deploy migrations to ${{ needs.resolve-target.outputs.target_environment }}
     needs: resolve-target
     runs-on: ubuntu-latest
+
+    # GitHub pauses this job for the configured Environment approval.
     environment:
       name: ${{ needs.resolve-target.outputs.target_environment }}
+
     env:
       SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
@@ -162,27 +305,41 @@ jobs:
         shell: bash
         run: |
           case "${{ needs.resolve-target.outputs.target_environment }}" in
+
             UAT)
               echo "config_file=config/uat.yml" >> "$GITHUB_OUTPUT"
               echo "history_table=NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_UAT" >> "$GITHUB_OUTPUT"
               ;;
+
             PROD)
               echo "config_file=config/prod.yml" >> "$GITHUB_OUTPUT"
               echo "history_table=NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_PROD" >> "$GITHUB_OUTPUT"
               ;;
-            *) echo "::error::Unsupported deployment environment"; exit 1 ;;
+
+            *)
+              echo "::error::Unsupported deployment environment"
+              exit 1
+              ;;
+
           esac
 
       - name: Validate required Snowflake environment variables
         shell: bash
         run: |
           set -euo pipefail
-          for variable in SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_ROLE SNOWFLAKE_WAREHOUSE; do
+
+          for variable in \
+            SNOWFLAKE_ACCOUNT \
+            SNOWFLAKE_USER \
+            SNOWFLAKE_ROLE \
+            SNOWFLAKE_WAREHOUSE
+          do
             if [[ -z "${!variable:-}" ]]; then
               echo "::error::$variable is not configured in the selected GitHub Environment."
               exit 1
             fi
           done
+
           echo "Required Snowflake connection variables are configured."
 
       - name: Write Snowflake private key from GitHub Environment secret
@@ -192,14 +349,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ -z "${SNOWFLAKE_PRIVATE_KEY_P8:-}" ]]; then
             echo "::error::GitHub Environment secret SNOWFLAKE_PRIVATE_KEY_P8 is missing."
             exit 1
           fi
+
           KEY_FILE="$RUNNER_TEMP/snowflake_deploy_key.p8"
+
           umask 077
           printf '%s' "$SNOWFLAKE_PRIVATE_KEY_P8" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
+
           echo "SNOWFLAKE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
           echo "key_file_ready=true" >> "$GITHUB_OUTPUT"
 
@@ -211,7 +372,9 @@ jobs:
           echo "Deployment ID created for this workflow run."
 
       - name: Verify Schemachange configuration
-        run: schemachange verify --config-file-name "${{ steps.config.outputs.config_file }}"
+        run: |
+          schemachange verify \
+            --config-file-name "${{ steps.config.outputs.config_file }}"
 
       - name: Preview pending migrations
         run: |
@@ -219,18 +382,18 @@ jobs:
             --config-file-name "${{ steps.config.outputs.config_file }}" \
             --dry-run
 
-      # Set the timestamp only for actual deployment execution. A manual dry-run
-      # will create a parent audit record but will not attach old history rows.
       - name: Mark migration execution start
-        if: github.event_name == 'push' || inputs.dry_run == false
+        if: success()
         shell: bash
         run: |
           echo "DEPLOYMENT_STARTED_AT=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')" >> "$GITHUB_ENV"
 
       - name: Execute pending migrations
         id: execute-migrations
-        if: github.event_name == 'push' || inputs.dry_run == false
-        run: schemachange deploy --config-file-name "${{ steps.config.outputs.config_file }}"
+        if: success()
+        run: |
+          schemachange deploy \
+            --config-file-name "${{ steps.config.outputs.config_file }}"
 
       - name: Record deployment and migration audit in Snowflake
         if: always() && steps.write-private-key.outputs.key_file_ready == 'true'
@@ -239,9 +402,12 @@ jobs:
           DEPLOY_ENVIRONMENT: ${{ needs.resolve-target.outputs.target_environment }}
           DEPLOY_COMMIT_SHA: ${{ needs.resolve-target.outputs.deploy_sha }}
           DEPLOY_SOURCE_BRANCH: ${{ github.ref_name }}
-          DEPLOYMENT_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'DRY_RUN' || 'EXECUTE' }}
+          DEPLOYMENT_MODE: EXECUTE
           DEPLOYMENT_STATUS: ${{ job.status }}
           SCHEMACHANGE_CHANGE_HISTORY_TABLE: ${{ steps.config.outputs.history_table }}
+          UAT_VALIDATION_RUN_ID: ${{ needs.resolve-target.outputs.uat_run_id }}
+          PROMOTION_SOURCE_BRANCH: ${{ needs.resolve-target.outputs.promotion_source_branch }}
+          VALIDATED_SOURCE_SHA: ${{ needs.resolve-target.outputs.validated_source_sha }}
         run: python write_deployment_audit.py
 
       - name: Clean up temporary private key

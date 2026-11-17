@@ -1,24 +1,20 @@
 # NAS Snowflake deployment workflow
 #
-# Automatic promotion after a push/merge (with validation in this workflow):
-#   - develop -> DEV deployment.
+# Automatic promotion:
 #   - release/* -> UAT deployment (GitHub Environment approval).
 # Production promotion:
-#   - Manually run this workflow from the same release branch and provide
+#   - Manually run this workflow from a release branch and provide
 #     the exact commit SHA that passed UAT. PROD Environment approval is required.
 #
-# Configure GitHub Environments named exactly DEV, UAT and PROD.
-# In EACH Environment, configure:
-#   Variables: SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_ROLE,
-#              SNOWFLAKE_WAREHOUSE
-#   Secret:    SNOWFLAKE_PRIVATE_KEY_P8
-# GitHub-hosted ubuntu-latest runners are used.
+# DEV is deployed by ci-validation.yml. This workflow deliberately does not
+# deploy develop, preventing two workflows from applying the same DEV migrations.
+# Deployment metadata is written to NAS_ADMIN.SCHEMACHANGE.DEPLOYMENT_AUDIT.
 
 name: NAS Snowflake Schemachange Deployment
 
 on:
   push:
-    branches: [develop, 'release/**']
+    branches: ['release/**']
   workflow_dispatch:
     inputs:
       release_commit:
@@ -33,6 +29,8 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
+  actions: read
 
 concurrency:
   group: snowflake-deploy-${{ github.sha }}
@@ -64,8 +62,7 @@ jobs:
           import re
           import yaml
 
-          files = (list(Path("config").glob("*.yml"))
-                   + list(Path(".github/workflows").glob("*.yml")))
+          files = (list(Path("config").glob("*.yml")) + list(Path(".github/workflows").glob("*.yml")))
           if not files:
               raise SystemExit("No YAML files found")
           for path in files:
@@ -117,7 +114,6 @@ jobs:
             DEPLOY_SHA="$INPUT_RELEASE_COMMIT"
           else
             case "$SOURCE_BRANCH" in
-              develop) TARGET_ENV="DEV" ;;
               release/*) TARGET_ENV="UAT" ;;
               *) echo "::error::Unsupported source branch: $SOURCE_BRANCH"; exit 1 ;;
             esac
@@ -137,15 +133,11 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: ${{ needs.resolve-target.outputs.target_environment }}
-
-    # Map GitHub Environment variables into process environment variables.
-    # Schemachange resolves these through env_var() in config/*.yml.
     env:
       SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
       SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
       SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
-      SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
 
     steps:
       - name: Checkout exact deployment commit
@@ -159,7 +151,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Confirm this package version against the NAS-approved Schemachange release.
       - name: Install Schemachange
         run: |
           python -m pip install --upgrade pip
@@ -189,6 +180,7 @@ jobs:
           echo "Required Snowflake connection variables are configured."
 
       - name: Write Snowflake private key from GitHub Environment secret
+        id: write-private-key
         env:
           SNOWFLAKE_PRIVATE_KEY_P8: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_P8 }}
         shell: bash
@@ -198,46 +190,37 @@ jobs:
             echo "::error::GitHub Environment secret SNOWFLAKE_PRIVATE_KEY_P8 is missing."
             exit 1
           fi
+          KEY_FILE="$RUNNER_TEMP/snowflake_deploy_key.p8"
           umask 077
-          printf '%s' "$SNOWFLAKE_PRIVATE_KEY_P8" > "$SNOWFLAKE_PRIVATE_KEY_FILE"
-          chmod 600 "$SNOWFLAKE_PRIVATE_KEY_FILE"
-          echo "Snowflake private key file created."
+          printf '%s' "$SNOWFLAKE_PRIVATE_KEY_P8" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          echo "SNOWFLAKE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
+          echo "key_file_ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Verify Schemachange configuration
-        # Explicit step-level mapping ensures these values are present in the
-        # process environment read by Schemachange's env_var() configuration.
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
-          SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
-        run: |
-          schemachange verify --config-file-name "${{ steps.config.outputs.config_file }}"
+        run: schemachange verify --config-file-name "${{ steps.config.outputs.config_file }}"
 
       - name: Preview pending migrations
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
-          SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
         run: |
           schemachange deploy \
             --config-file-name "${{ steps.config.outputs.config_file }}" \
             --dry-run
 
       - name: Execute pending migrations
+        id: execute-migrations
         if: github.event_name == 'push' || inputs.dry_run == false
+        run: schemachange deploy --config-file-name "${{ steps.config.outputs.config_file }}"
+
+      - name: Record deployment audit in Snowflake
+        if: always() && steps.write-private-key.outputs.key_file_ready == 'true'
         env:
-          SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
-          SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
-          SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
-          SNOWFLAKE_PRIVATE_KEY_FILE: ${{ runner.temp }}/snowflake_deploy_key.p8
-        run: |
-          schemachange deploy \
-            --config-file-name "${{ steps.config.outputs.config_file }}"
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_ENVIRONMENT: ${{ needs.resolve-target.outputs.target_environment }}
+          DEPLOY_COMMIT_SHA: ${{ needs.resolve-target.outputs.deploy_sha }}
+          DEPLOY_SOURCE_BRANCH: ${{ github.ref_name }}
+          DEPLOYMENT_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'DRY_RUN' || 'EXECUTE' }}
+          DEPLOYMENT_STATUS: ${{ job.status }}
+        run: python scripts/write_deployment_audit.py
 
       - name: Clean up temporary private key
         if: always()

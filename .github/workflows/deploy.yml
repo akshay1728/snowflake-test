@@ -308,12 +308,12 @@ jobs:
 
             UAT)
               echo "config_file=config/uat.yml" >> "$GITHUB_OUTPUT"
-              echo "history_table=NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_UAT" >> "$GITHUB_OUTPUT"
+              echo "history_table=NAS_ADMIN.SCHEMACHANGE.CHANGE_HISTORY_UAT" >> "$GITHUB_OUTPUT"
               ;;
 
             PROD)
               echo "config_file=config/prod.yml" >> "$GITHUB_OUTPUT"
-              echo "history_table=NAS_MONITORING.SCHEMACHANGE.CHANGE_HISTORY_PROD" >> "$GITHUB_OUTPUT"
+              echo "history_table=NAS_ADMIN.SCHEMACHANGE.CHANGE_HISTORY_PROD" >> "$GITHUB_OUTPUT"
               ;;
 
             *)

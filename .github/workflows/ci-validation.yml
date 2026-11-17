@@ -166,7 +166,7 @@ jobs:
           DEPLOY_SOURCE_BRANCH: ${{ github.ref_name }}
           DEPLOYMENT_MODE: EXECUTE
           DEPLOYMENT_STATUS: ${{ job.status }}
-        run: python scripts/write_deployment_audit.py
+        run: python write_deployment_audit.py
 
       - name: Clean up temporary private key
         if: always()

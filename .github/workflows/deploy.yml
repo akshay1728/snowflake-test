@@ -220,7 +220,7 @@ jobs:
           DEPLOY_SOURCE_BRANCH: ${{ github.ref_name }}
           DEPLOYMENT_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'DRY_RUN' || 'EXECUTE' }}
           DEPLOYMENT_STATUS: ${{ job.status }}
-        run: python scripts/write_deployment_audit.py
+        run: python write_deployment_audit.py
 
       - name: Clean up temporary private key
         if: always()

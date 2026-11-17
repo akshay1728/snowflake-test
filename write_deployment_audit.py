@@ -183,6 +183,10 @@ def main() -> None:
     )
 
     deployment_id = str(uuid.uuid4())
+
+    # Use INSERT ... SELECT rather than INSERT ... VALUES. Snowflake rejects
+    # PARSE_JSON() expressions in this VALUES form; SELECT permits the VARIANT
+    # conversions while keeping all supplied data safely parameter-bound.
     sql = f"""
         INSERT INTO {AUDIT_TABLE}
         (
@@ -194,13 +198,12 @@ def main() -> None:
             ENVIRONMENT_APPROVALS, APPROVALS_RETRIEVED_AT, DEPLOYMENT_ACTOR,
             DEPLOYMENT_STATUS, DEPLOYMENT_MODE, SCHEMACHANGE_VERSION
         )
-        VALUES
-        (
+        SELECT
             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
             TO_TIMESTAMP_TZ(%s), %s, PARSE_JSON(%s), PARSE_JSON(%s), %s, %s,
             PARSE_JSON(%s), TO_TIMESTAMP_TZ(%s), %s, %s, %s, %s
-        )
     """
+
     params = (
         deployment_id,
         environment,
@@ -229,6 +232,7 @@ def main() -> None:
         mode,
         schemachange_version,
     )
+
     try:
         with connection.cursor() as cursor:
             cursor.execute(sql, params)

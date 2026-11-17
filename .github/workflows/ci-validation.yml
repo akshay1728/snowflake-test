@@ -1,16 +1,8 @@
 # NAS Snowflake CI validation
 #
-# Pull requests:
-#   - Validate YAML syntax, required environment configurations,
-#     migration naming and unique migration version identifiers.
-#   - Confirm sql_scripts/ remains separate from the Schemachange input folder.
-#
-# After merge/push to develop or release/*:
-#   - develop: run DEV Schemachange verification and dry-run.
-#   - release/*: successful CI triggers UAT deployment, which pauses for
-#     approval through the UAT GitHub Environment.
-#
-# No SQL linting, dbt, SQL validation test suite or CyberArk integration is included.
+# develop: validate, verify, dry-run and deploy to DEV.
+# release/*: repository validation runs here; deploy.yml handles UAT.
+# Deployment metadata is written to NAS_ADMIN.SCHEMACHANGE.DEPLOYMENT_AUDIT.
 
 name: NAS Snowflake CI Validation
 
@@ -22,6 +14,8 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
+  actions: read
 
 jobs:
   repository-validation:
@@ -47,19 +41,16 @@ jobs:
           import re
           import yaml
 
-          # Parse repository environment configuration and workflow YAML files.
           yaml_files = (
               list(Path("config").glob("*.yml"))
               + list(Path(".github/workflows").glob("*.yml"))
           )
           if not yaml_files:
               raise SystemExit("No YAML configuration or workflow files found.")
-
           for path in yaml_files:
               yaml.safe_load(path.read_text(encoding="utf-8"))
               print(f"Valid YAML: {path}")
 
-          # Ensure all environment configuration files are present.
           required_configs = {
               Path("config/dev.yml"),
               Path("config/uat.yml"),
@@ -69,11 +60,9 @@ jobs:
           if missing:
               raise SystemExit(f"Missing environment configuration(s): {missing}")
 
-          # Validate deployment migration filenames and unique version identifiers.
           migration_files = sorted(Path("migrations").rglob("*.sql"))
           if not migration_files:
               raise SystemExit("No deployment SQL found under migrations/")
-
           versions = set()
           for path in migration_files:
               if path.name.startswith("V"):
@@ -88,29 +77,26 @@ jobs:
                   if not re.match(r"^[RA]__[a-z0-9_]+\.sql$", path.name):
                       raise SystemExit(f"Invalid repeatable/always migration filename: {path}")
               else:
-                  raise SystemExit(
-                      f"Unsupported migration prefix in {path}; expected V, R__ or A__."
-                  )
+                  raise SystemExit(f"Unsupported migration prefix in {path}; expected V, R__ or A__.")
 
-          # Count working SQL files; these are not Schemachange deployment inputs.
           working_files = list(Path("sql_scripts").rglob("*.sql"))
           print(f"Validated {len(migration_files)} deployment migration(s).")
-          print(f"Found {len(working_files)} working SQL script(s); sql_scripts/ is not deployed.")
+          print(f"Found {len(working_files)} working/admin SQL script(s); sql_scripts/ is not deployed.")
           PY
 
   dev-schemachange-preflight:
-    name: DEV Schemachange dry-run
+    name: DEV Schemachange deployment
     if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     needs: repository-validation
     runs-on: ubuntu-latest
     environment:
       name: DEV
-    # Expose GitHub DEV Environment variables to Schemachange env_var().
     env:
       SNOWFLAKE_ACCOUNT: ${{ vars.SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ vars.SNOWFLAKE_USER }}
       SNOWFLAKE_ROLE: ${{ vars.SNOWFLAKE_ROLE }}
       SNOWFLAKE_WAREHOUSE: ${{ vars.SNOWFLAKE_WAREHOUSE }}
+
     steps:
       - name: Checkout merged develop commit
         uses: actions/checkout@v4
@@ -122,15 +108,14 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Confirm this package version against the NAS-approved Schemachange release.
       - name: Install Schemachange
         run: |
           python -m pip install --upgrade pip
           pip install schemachange==4.2.0
 
       - name: Write DEV private key from GitHub Environment secret
+        id: write-dev-key
         env:
-          # Create this as an environment-level secret in GitHub Environment DEV.
           SNOWFLAKE_PRIVATE_KEY_P8: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_P8 }}
         shell: bash
         run: |
@@ -144,6 +129,7 @@ jobs:
           printf '%s' "$SNOWFLAKE_PRIVATE_KEY_P8" > "$KEY_FILE"
           chmod 600 "$KEY_FILE"
           echo "SNOWFLAKE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
+          echo "key_file_ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Validate DEV Snowflake environment variables
         shell: bash
@@ -158,8 +144,7 @@ jobs:
           done
 
       - name: Verify DEV Schemachange configuration
-        run: |
-          schemachange verify --config-file-name config/dev.yml
+        run: schemachange verify --config-file-name config/dev.yml
 
       - name: Preview pending DEV migrations
         run: |
@@ -168,11 +153,20 @@ jobs:
             --dry-run
 
       - name: Execute pending DEV migrations
+        id: execute-dev-migrations
         if: success()
-        shell: bash
-        run: |
-          schemachange deploy \
-            --config-file-name config/dev.yml
+        run: schemachange deploy --config-file-name config/dev.yml
+
+      - name: Record DEV deployment audit in Snowflake
+        if: always() && steps.write-dev-key.outputs.key_file_ready == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DEPLOY_ENVIRONMENT: DEV
+          DEPLOY_COMMIT_SHA: ${{ github.sha }}
+          DEPLOY_SOURCE_BRANCH: ${{ github.ref_name }}
+          DEPLOYMENT_MODE: EXECUTE
+          DEPLOYMENT_STATUS: ${{ job.status }}
+        run: python scripts/write_deployment_audit.py
 
       - name: Clean up temporary private key
         if: always()
